@@ -273,8 +273,7 @@ class SenderThread(threading.Thread):
        buffering we might need to do if we can't establish a connection
        and we need to spool to disk.  That isn't implemented yet."""
 
-    def __init__(self, reader, dryrun, self_stats, 
-                 server_ip, server_port=DEFAULT_PORT):
+    def __init__(self, reader, dryrun, server_ip, server_port=DEFAULT_PORT):
         """Constructor.
 
         Args:
@@ -290,10 +289,7 @@ class SenderThread(threading.Thread):
         self.reader = reader
         self.server_ip = server_ip  # The current OpsMonitor host we've selected.
         self.server_port = server_port  # The port of the current OpsMonitor.
-        self.conn = None   # The socket connected to the aforementioned OpsMonitor.
-        self.last_verify = 0
         self.sendq = []
-        self.self_stats = self_stats
 
     def run(self):
         """Main loop.  A simple scheduler.  Loop waiting for 5
@@ -306,7 +302,6 @@ class SenderThread(threading.Thread):
         errors = 0  # How many uncaught exceptions in a row we got.
         while ALIVE:
             try:
-                self.maintain_conn()
                 try:
                     line = self.reader.readerq.get(True, 5)
                 except Empty:
@@ -341,132 +336,6 @@ class SenderThread(threading.Thread):
                 shutdown()
                 raise
 
-    def verify_conn(self):
-        """Periodically verify that our connection to the OpsMonitor is OK
-           and that the OpsMonitor is alive/working."""
-
-        if self.conn is None:
-            return False
-
-        # if the last verification was less than a minute ago, don't re-verify
-        if self.last_verify > time.time() - 60:
-            return True
-
-        # we use the version command as it is very low effort for the OpsMonitor
-        # to respond
-        LOG.debug('verifying our OpsMonitor connection is alive')
-        try:
-            self.conn.sendall('version\n')
-        except socket.error, msg:
-            self.conn = None
-            return False
-
-        bufsize = 4096
-        while ALIVE:
-            # try to read as much data as we can.  at some point this is going
-            # to block, but we have set the timeout low when we made the
-            # connection
-            try:
-                buf = self.conn.recv(bufsize)
-            except socket.error, msg:
-                self.conn = None
-                return False
-
-            # If we don't get a response to the `version' request, the OpsMonitor
-            # must be dead or overloaded.
-            if not buf:
-                self.conn = None
-                return False
-
-            # Woah, the OpsMonitor has a lot of things to tell us...  Let's make
-            # sure we read everything it sent us by looping once more.
-            if len(buf) == bufsize:
-                continue
-
-            # If everything is good, send out our meta stats.  This
-            # helps to see what is going on with the omcollector.
-            # TODO need to fix this for http
-            if self.self_stats:
-                strs = [
-                        ('reader.lines_collected',
-                         '', self.reader.lines_collected),
-                        ('reader.lines_dropped',
-                         '', self.reader.lines_dropped)
-                       ]
-
-                for col in all_living_collectors():
-                    strs.append(('collector.lines_sent', 'collector='
-                                 + col.name, col.lines_sent))
-                    strs.append(('collector.lines_received', 'collector='
-                                 + col.name, col.lines_received))
-                    strs.append(('collector.lines_invalid', 'collector='
-                                 + col.name, col.lines_invalid))
-
-                ts = int(time.time())
-                strout = ["omcollector.%s %d %d %s"
-                          % (x[0], ts, x[2], x[1]) for x in strs]
-                for string in strout:
-                    LOG.info(string)
-
-            break  # OpsMonitor is alive.
-
-        # if we get here, we assume the connection is good
-        self.last_verify = time.time()
-        return True
-
-    def maintain_conn(self):
-        """Safely connect to the OpsMonitor and ensure that it's up and
-           running and that we're not talking to a ghost connection
-           (no response)."""
-
-        # dry runs are always good
-        if self.dryrun:
-            return
-
-        # connection didn't verify, so create a new one.  we might be in
-        # this method for a long time while we sort this out.
-        try_delay = 1
-        while ALIVE:
-            if self.verify_conn():
-                return
-
-            # increase the try delay by some amount and some random value,
-            # in case the OpsMonitor is down for a while.  delay at most
-            # approximately 10 minutes.
-            try_delay *= 1 + random.random()
-            if try_delay > 600:
-                try_delay *= 0.5
-            LOG.debug('SenderThread blocking %0.2f seconds', try_delay)
-            time.sleep(try_delay)
-
-            # Now actually try the connection.
-            try:
-                addresses = socket.getaddrinfo(self.server_ip, self.server_port,
-                                               socket.AF_UNSPEC,
-                                               socket.SOCK_STREAM, 0)
-            except socket.gaierror, e:
-                # Don't croak on transient DNS resolution issues.
-                if e[0] in (socket.EAI_AGAIN, socket.EAI_NONAME,
-                            socket.EAI_NODATA):
-                    LOG.debug('DNS resolution failure: %s: %s', self.server_ip, e)
-                    continue
-                raise
-            for family, socktype, proto, canonname, sockaddr in addresses:
-                try:
-                    self.conn = socket.socket(family, socktype, proto)
-                    self.conn.settimeout(5)
-                    self.conn.connect(sockaddr)
-                    # if we get here it connected
-                    LOG.debug('Connection to %s was successful'%(str(sockaddr)))
-                    break
-                except socket.error, msg:
-                    LOG.warning('Connection attempt failed to %s:%d: %s',
-                                self.server_ip, self.server_port, msg)
-                self.conn.close()
-                self.conn = None
-            if not self.conn:
-                LOG.error('Failed to connect to %s:%d', self.server_ip, self.server_port)
-
     def send_data(self):
         """Sends outstanding data in self.sendq to the OpsMonitor in one operation."""
 
@@ -477,41 +346,21 @@ class SenderThread(threading.Thread):
             metrics.append(m)
 
         if not metrics:
-            LOG.debug('send_data no data?')
+            LOG.debug('send_data no data')
             return
 			
-        LOG.debug(metrics)
+        LOG.debug(str(metrics))
 
         # try sending our data.  if an exception occurs, just error and
         # try sending again next time.
-        try:
-            if self.dryrun:
-                sys.stdout.write(str(metrics) + '\n')
-                return
-            else:
-                sender = ZabbixSender(self.server_ip)
-                messages = sender.create_messages(metrics)
-                request = sender.create_request(messages)
-                packet = sender.create_packet(request)
-                self.conn.sendall(packet)
-            self.sendq = []
-        except socket.error, msg:
-            LOG.error('failed to send data: %s', msg)
-            try:
-                self.conn.close()
-            except socket.error:
-                pass
-            self.conn = None
-
-        # reading the result to drain the packets out of the kernel's queue
-        response = sender.get_response(connection)
-        LOG.debug('%s response: %s', self.server_ip, response)
-
-        if response and response.get('response') == 'success':
-            return True
+        
+        if self.dryrun:
+            sys.stdout.write(str(metrics) + '\n')
+            return
         else:
-            LOG.debug('Response error: %s}', response)
-            return False
+            sender = ZabbixSender(self.server_ip, self.server_port)
+            if sender.send(metrics):
+                self.sendq = []
 
 
 class ZabbixMetric(object):
@@ -546,7 +395,7 @@ class ZabbixMetric(object):
         """Represent detailed ZabbixMetric view."""
 
         result = json.dumps(self.__dict__)
-        logger.debug('%s: %s', self.__class__.__name__, result)
+        LOG.debug('%s: %s', self.__class__.__name__, result)
 
         return result
 
@@ -576,9 +425,10 @@ class ZabbixSender(object):
     >>> zbx.send(metric)
     """
 
-    def __init__(self, zabbix_server='127.0.0.1', zabbix_port=10051):
+    def __init__(self, server_ip='127.0.0.1', server_port=10051):
 
-        self.zabbix_uri = [(zabbix_server, zabbix_port)]
+        self.server_ip = server_ip
+        self.server_port = server_port
 
     def __repr__(self):
         """Represent detailed ZabbixSender view."""
@@ -600,13 +450,13 @@ class ZabbixSender(object):
 
         buf = b''
 
-        while True:
-            chunk = sock.recv(1024)
+        while len(buf) < count:
+            chunk = sock.recv(count - len(buf))
             if not chunk:
                 break
             buf += chunk
 
-        return buf[:count]
+        return buf
 
     def create_messages(self, metrics):
         """Create a list of zabbix messages from a list of ZabbixMetrics.
@@ -658,7 +508,6 @@ class ZabbixSender(object):
         data_len = struct.pack('<Q', len(request))
         packet = b'ZBXD\x01' + data_len + request
 
-        ord23 = lambda x: ord(x) if not isinstance(x, int) else x
         LOG.debug('Packet [str]: %s', packet)
         return packet
 
@@ -698,40 +547,43 @@ class ZabbixSender(object):
         :return: `True` if messages was sent successful, else `False`.
         """
 
-        result = None
-
         messages = self.create_messages(metrics)
         request = self.create_request(messages)
         packet = self.create_packet(request)
 
-        for host_addr in self.zabbix_uri:
-            LOG.debug('Sending data to %s', host_addr)
+        LOG.debug('Sending data to %s:%s'  
+                  % (self.server_ip, self.server_port))
 
-            # create socket object
+        try:
             connection = socket.socket()
+            connection.settimeout(5)
+            connection.connect((self.server_ip, self.server_port))
+            LOG.debug('Connection to %s:%s was successful' 
+                      %(self.server_ip, self.server_port))
+        except socket.error, msg:		
+            LOG.warning('Connection attempt failed to %s:%d: %s'
+                    %(self.server_ip, self.server_port, msg))
+            connection.close()
 
-            # server and port must be tuple
-            connection.connect(host_addr)
-
+        try:
+            connection.sendall(packet)
+        except socket.error, msg:
+            LOG.error('failed to send data: %s', msg)
             try:
-                connection.sendall(packet)
-            except Exception as err:
-                # In case of error we should close connection, otherwise
-                # we will close it afret data will be received.
                 connection.close()
-                raise Exception(err)
+            except socket.error:
+                pass
+            return False
 
-            response = self.get_response(connection)
-            LOG.debug('%s response: %s', host_addr, response)
+        response = self.get_response(connection)
+        LOG.debug('%s response: %s', self.server_ip, response)
 
-            if response and response.get('response') == 'success':
-                result = True
-            else:
-                LOG.debug('Response error: %s}', response)
-                raise Exception(response)
-
-        return result
-		
+        if response and response.get('response') == 'success':
+            return True
+        else:
+            LOG.debug('Response error: %s}', response)
+            return False
+			
 
 def setup_logging(logfile=DEFAULT_LOG, max_bytes=None, backup_count=None):
     """Sets up logging and associated handlers."""
@@ -747,7 +599,7 @@ def setup_logging(logfile=DEFAULT_LOG, max_bytes=None, backup_count=None):
     ch.setFormatter(logging.Formatter('%(asctime)s %(name)s[%(process)d] '
                                       '%(levelname)s: %(message)s'))
     LOG.addHandler(ch)
-
+	
 
 def parse_cmdline(argv):
     """Parses the command-line."""
@@ -756,11 +608,10 @@ def parse_cmdline(argv):
         import config
         defaults = config.get_defaults()
     except ImportError:
-        sys.stderr.write("ImportError: Could not load defaults from configuration. Using hardcoded values")
+        sys.stderr.write("ImportError: Could not load defaults from configuration. Using hardcoded values\n")
         default_cdir = os.path.join(os.path.dirname(os.path.realpath(sys.argv[0])), 'collectors')
         defaults = {
             'verbose': False,
-            'no_self_stats': False,
             'allowed_inactivity_time': 600,
             'dryrun': False,
             'max_bytes': 64 * 1024 * 1024,
@@ -794,10 +645,6 @@ def parse_cmdline(argv):
     parser.add_option('-H', '--server_ip', dest='server_ip',
                         default=defaults['server_ip'],
                         help='Hostname to use to connect to the OpsMonitor.')
-    parser.add_option('--no-omcollector-stats', dest='no_self_stats',
-                        action='store_true',
-                        default=defaults['no_self_stats'],
-                        help='Prevent omcollector from reporting its own stats to OpsMonitor')
     parser.add_option('-s', '--stdin', dest='stdin', action='store_true',
                         default=defaults['stdin'],
                         help='Run once, read and dedup data points from stdin.')
@@ -915,7 +762,7 @@ def main(argv):
     reader.start()
 
     # and setup the sender to start writing out to the conn
-    sender = SenderThread(reader, options.dryrun, not options.no_self_stats,
+    sender = SenderThread(reader, options.dryrun,
                           options.server_ip, options.port)
     sender.start()
     LOG.info('SenderThread startup complete')
