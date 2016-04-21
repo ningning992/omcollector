@@ -237,8 +237,8 @@ class StdinCollector(Collector):
         line = sys.stdin.readline()
         if line:
             self.datalines.append(line.rstrip())
-        else:
-            ALIVE = False
+#        else:
+#            ALIVE = False
 
 
     def shutdown(self):

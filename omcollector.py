@@ -259,7 +259,8 @@ class SenderThread(threading.Thread):
     """The SenderThread is responsible for connecting to the OpsMonitor
        and sending the data to it."""
 
-    def __init__(self, reader, dryrun,server_ip, server_port=DEFAULT_PORT):
+    def __init__(self, reader, dryrun,server_ip,
+                 server_port=DEFAULT_PORT, wait_data=True):
         """Constructor.
 
         Args:
@@ -273,6 +274,7 @@ class SenderThread(threading.Thread):
         self.server_ip = server_ip  # The current OpsMonitor host we've selected.
         self.server_port = server_port  # The port of the current OpsMonitor.
         self.sendq = []
+        self.wait_data = wait_data
 
     def run(self):
         """Main loop. A simple scheduler. Loop waiting for 5 seconds for data on
@@ -288,8 +290,9 @@ class SenderThread(threading.Thread):
                 except Empty:
                     continue
                 self.sendq.append(line)
-                LOG.debug('Waiting 5 seconds for more data')
-                time.sleep(5)  # Wait for more data
+                if self.wait_data:
+                    LOG.debug('Waiting 5 seconds for more data')
+                    time.sleep(5)  # Wait for more data
                 while True:
                     # prevents self.sendq fast growing in case of sending fails
                     # in send_data()
@@ -303,7 +306,7 @@ class SenderThread(threading.Thread):
                         break
                     self.sendq.append(line)
 
-                if ALIVE:
+                if ALIVE or not self.wait_data:
                     self.send_data()
                 errors = 0  # We managed to do a successful iteration.
             except (ArithmeticError, EOFError, EnvironmentError, LookupError,
@@ -709,9 +712,13 @@ def main(argv):
     reader = ReaderThread()
     reader.start()
 
+    wait_data = True
+    if options.stdin:
+        wait_data = False
+
     # and setup the sender to start writing out to the conn
     sender = SenderThread(reader, options.dryrun,
-                          options.server_ip, options.port)
+                          options.server_ip, options.port, wait_data)
     sender.start()
     LOG.info('SenderThread startup complete')
 
@@ -738,8 +745,8 @@ def stdin_loop(options, modules, sender):
     global ALIVE
     next_heartbeat = int(time.time() + 600)
     while ALIVE:
-        time.sleep(15)
-        reload_changed_config_modules(modules, options, sender)
+        time.sleep(1)
+#        reload_changed_config_modules(modules, options, sender)
         now = int(time.time())
         if now >= next_heartbeat:
             LOG.info('Heartbeat (%d collectors running)'
