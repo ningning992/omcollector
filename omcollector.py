@@ -37,10 +37,9 @@ LOG = logging.getLogger('omcollector')
 ALIVE = True
 # If the SenderThread catches more than this many consecutive uncaught
 # exceptions, something is not right and omcollector will shutdown.
-# Hopefully some kind of supervising daemon will then restart it.
 MAX_UNCAUGHT_EXCEPTIONS = 100
 DEFAULT_PORT = 10051
-# How long to wait for datapoints before assuming
+# How long to wait for data before assuming
 # a collector is dead and restarting it
 ALLOWED_INACTIVITY_TIME = 600  # seconds
 MAX_SENDQ_SIZE = 10000
@@ -50,7 +49,7 @@ MAX_READQ_SIZE = 100000
 def register_collector(collector):
     """Register a collector with the COLLECTORS global"""
 
-    assert isinstance(collector, Collector), "collector=%r" % (collector,)
+    assert isinstance(collector, Collector), 'collector=%r' % (collector,)
     # store it in the global list and initiate a kill for anybody with the
     # same name that happens to still be hanging around
     if collector.name in COLLECTORS:
@@ -60,6 +59,7 @@ def register_collector(collector):
                       ' terminating', col.name, col.proc.pid)
             col.shutdown()
 
+    LOG.info('Register collector: %s', collector.name)
     COLLECTORS[collector.name] = collector
 
 
@@ -71,8 +71,9 @@ class ReaderQueue(Queue):
            queue is full, and returns false if we dropped."""
         try:
             self.put(value, block=False)
+            LOG.debug('Put value into ReaderQueue: %s', value)
         except Full:
-            LOG.error("QUEUE FULL ERROR, DROPPED DATA: %s", value)
+            LOG.error('QUEUE FULL ERROR, DROPPED DATA: %s', value)
             return False
         return True
 
@@ -96,7 +97,7 @@ class Collector(object):
         self.dead = False
         self.mtime = mtime
         self.generation = GENERATION
-        self.buffer = ""
+        self.buffer = ''
         self.datalines = []
         self.lines_sent = 0
         self.lines_received = 0
@@ -104,8 +105,8 @@ class Collector(object):
         self.last_datapoint = int(time.time())
 
     def read(self):
-        """Read bytes from our subprocess and store them in our temporary
-           line storage buffer.  This needs to be non-blocking."""
+        """Read bytes from subprocess and store them in temporary
+           line storage buffer."""
 
         # read stderr for log messages
         try:
@@ -125,7 +126,7 @@ class Collector(object):
         try:
             self.buffer += self.proc.stdout.read()
             if len(self.buffer):
-                LOG.debug('reading %s, buffer now %d bytes',
+                LOG.debug('reading [%s], buffer now %d bytes',
                           self.name, len(self.buffer))
         except IOError, (err, msg):
             if err != errno.EAGAIN:
@@ -191,16 +192,10 @@ class StdinCollector(Collector):
 
     def __init__(self):
         super(StdinCollector, self).__init__('stdin', 0, '<stdin>')
-
-        # hack to make this work.  nobody else will rely on self.proc
-        # except as a test in the stdin mode.
         self.proc = True
 
     def read(self):
-        """Read lines from STDIN and store them.  We allow this to
-           be blocking because there should only ever be one
-           StdinCollector and no normal collectors, so the ReaderThread
-           is only serving us and we're allowed to block it."""
+        """Read lines from STDIN and store them."""
 
         global ALIVE
         line = sys.stdin.readline()
@@ -209,17 +204,14 @@ class StdinCollector(Collector):
         else:
             ALIVE = False
 
-
     def shutdown(self):
-
         pass
 
 
 class ReaderThread(threading.Thread):
-    """The main ReaderThread is responsible for reading from the collectors
-       and assuring that we always read from the input no matter what.
-       All data read is put into the self.readerq Queue, which is
-       consumed by the SenderThread."""
+    """The main ReaderThread is responsible for reading from the collectors.
+       All data read is put into the self.readerq Queue, which is consumed 
+	   by the SenderThread."""
 
     def __init__(self):
         """Constructor."""
@@ -230,22 +222,16 @@ class ReaderThread(threading.Thread):
         self.lines_dropped = 0
 
     def run(self):
-        """Main loop for this thread.  Just reads from collectors,
-           does our input processing and puts the data into the queue."""
+        """Main loop for this thread. Reads from collectors,
+           does data processing and puts the data into the queue."""
 
         LOG.debug("ReaderThread up and running")
 
-        # we loop every second for now.  ideally we'll setup some
-        # select or other thing to wait for input on our children,
-        # while breaking out every once in a while to setup selects
-        # on new children.
         while ALIVE:
             for col in all_living_collectors():
                 for line in col.collect():
                     self.process_line(col, line)
 
-            # and here is the loop that we really should get rid of, this
-            # just prevents us from spinning right now
             time.sleep(1)
 
     def process_line(self, col, line, delimiter=DELIMITER):
@@ -264,25 +250,22 @@ class ReaderThread(threading.Thread):
 			
         if not self.readerq.nput(data_list):
             self.lines_dropped += 1
+			
+        LOG.debug('[%s] line received: %d, line invalid: %d', 
+		          col.name, col.lines_received, col.lines_invalid)
 
 
 class SenderThread(threading.Thread):
-    """The SenderThread is responsible for maintaining a connection
-       to the OpsMonitor and sending the data we're getting over to it.  This
-       thread is also responsible for doing any sort of emergency
-       buffering we might need to do if we can't establish a connection
-       and we need to spool to disk.  That isn't implemented yet."""
+    """The SenderThread is responsible for connecting to the OpsMonitor
+       and sending the data to it."""
 
-    def __init__(self, reader, dryrun, server_ip, server_port=DEFAULT_PORT):
+    def __init__(self, reader, dryrun,server_ip, server_port=DEFAULT_PORT):
         """Constructor.
 
         Args:
           reader: A reference to a ReaderThread instance.
           dryrun: If true, data points will be printed on stdout instead of
-            being sent to the OpsMonitor.
-          self_stats: If true, the reader thread will insert its own
-            stats into the metrics reported to OpsMonitor, as if those metrics had
-            been read from a collector.
+                  being sent to the OpsMonitor.
         """
         super(SenderThread, self).__init__()
         self.dryrun = dryrun
@@ -292,29 +275,30 @@ class SenderThread(threading.Thread):
         self.sendq = []
 
     def run(self):
-        """Main loop.  A simple scheduler.  Loop waiting for 5
-           seconds for data on the queue.  If there's no data, just
-           loop and make sure our connection is still open.  If there
-           is data, wait 5 more seconds and grab all of the pending data and
-           send it.  A little better than sending every line as its
-           own packet."""
+        """Main loop. A simple scheduler. Loop waiting for 5 seconds for data on
+           the queue. If there is data, wait 5 more seconds and grab all of the
+           pending data and send it."""
 
         errors = 0  # How many uncaught exceptions in a row we got.
         while ALIVE:
             try:
                 try:
                     line = self.reader.readerq.get(True, 5)
+                    LOG.debug('Get line from readerq: %s', line)
                 except Empty:
                     continue
                 self.sendq.append(line)
+                LOG.debug('Waiting 5 seconds for more data')
                 time.sleep(5)  # Wait for more data
                 while True:
                     # prevents self.sendq fast growing in case of sending fails
                     # in send_data()
                     if len(self.sendq) > MAX_SENDQ_SIZE:
+                        LOG.warn('sendq is over %d', MAX_SENDQ_SIZE)
                         break
                     try:
                         line = self.reader.readerq.get(False)
+                        LOG.debug('Get line from readerq: %s', line)
                     except Empty:
                         break
                     self.sendq.append(line)
@@ -348,8 +332,7 @@ class SenderThread(threading.Thread):
         if not metrics:
             LOG.debug('send_data no data')
             return
-			
-        LOG.debug(str(metrics))
+
 
         # try sending our data.  if an exception occurs, just error and
         # try sending again next time.
@@ -364,19 +347,13 @@ class SenderThread(threading.Thread):
 
 
 class ZabbixMetric(object):
-    """The :class:`ZabbixMetric` contain one metric for zabbix server.
+    """ZabbixMetric contain one metric for zabbix server.
 
-    :type host: str
-    :param host: Hostname as it displayed in Zabbix.
-
-    :type key: str
-    :param key: Key by which you will identify this metric.
-
-    :type value: str
-    :param value: Metric value.
-
-    :type clock: int
-    :param clock: Unix timestamp. Current time will used if not specified.
+    Args:
+      host: Hostname as it displayed in Zabbix.
+      key: Key by which you will identify this metric.
+      value: Metric value.
+      clock: Unix timestamp. Current time will used if not specified.
 
     >>> from pyzabbix import ZabbixMetric
     >>> ZabbixMetric('localhost', 'cpu[usage]', 20)
@@ -401,23 +378,13 @@ class ZabbixMetric(object):
 
 
 class ZabbixSender(object):
-    """The :class:`ZabbixSender` send metrics to Zabbix server.
+    """ZabbixSender send metrics to Zabbix server.
 
-    Implementation of
-    `zabbix protocol <https://www.zabbix.com/documentation/1.8/protocols>`_.
+    Args:
+      server_ip: Zabbix server ip address. Default: `127.0.0.1`
+      server_port: Zabbix server port. Default: `10051`
 
-    :type zabbix_server: str
-    :param zabbix_server: Zabbix server ip address. Default: `127.0.0.1`
-
-    :type zabbix_port: int
-    :param zabbix_port: Zabbix server port. Default: `10051`
-
-    :type use_config: str
-    :param use_config: Path to zabbix_agentd.conf file to load settings from.
-         If value is `True` then default config path will used:
-         /etc/zabbix/zabbix_agentd.conf
-
-    >>> from pyzabbix import ZabbixMetric, ZabbixSender
+    >>> import ZabbixMetric, ZabbixSender
     >>> metrics = []
     >>> m = ZabbixMetric('localhost', 'cpu[usage]', 20)
     >>> metrics.append(m)
@@ -441,11 +408,9 @@ class ZabbixSender(object):
     def _receive(self, sock, count):
         """Reads socket to receive data from zabbix server.
 
-        :type socket: :class:`socket._socketobject`
-        :param socket: Socket to read.
-
-        :type count: int
-        :param count: Number of bytes to read from socket.
+        Args:
+          socket: Socket to read.
+          count: Number of bytes to read from socket.
         """
 
         buf = b''
@@ -461,11 +426,9 @@ class ZabbixSender(object):
     def create_messages(self, metrics):
         """Create a list of zabbix messages from a list of ZabbixMetrics.
 
-        :type metrics_array: list
-        :param metrics_array: List of :class:`zabbix.sender.ZabbixMetric`.
-
-        :rtype: list
-        :return: List of zabbix messages.
+        Args:
+          metrics_array: List of :class:`zabbix.sender.ZabbixMetric`.
+          return: List of zabbix messages.
         """
 
         messages = []
@@ -474,55 +437,44 @@ class ZabbixSender(object):
         for m in metrics:
             messages.append(str(m))
 
-        LOG.debug('Messages: %s', messages)
-
         return messages
 
     def create_request(self, messages):
         """Create a formatted request to zabbix from a list of messages.
 
-        :type messages: list
-        :param messages: List of zabbix messages
-
-        :rtype: list
-        :return: Formatted zabbix request
+        Args:
+          messages: List of zabbix messages
+          return: Formatted zabbix request
         """
 
         msg = ','.join(messages)
         request = '{{"request":"sender data","data":[{msg}]}}'.format(msg=msg)
         request = request.encode("utf-8")
-        LOG.debug('Request: %s', request)
 
         return request
 
     def create_packet(self, request):
         """Create a formatted packet from a request.
 
-        :type request: str
-        :param request: Formatted zabbix request
-
-        :rtype: str
-        :return: Data packet for zabbix
+        Args:
+          request: Formatted zabbix request
+          return: Data packet for zabbix
         """
 
         data_len = struct.pack('<Q', len(request))
         packet = b'ZBXD\x01' + data_len + request
 
-        LOG.debug('Packet [str]: %s', packet)
         return packet
 
     def get_response(self, connection):
         """Get response from zabbix server, reads from self.socket.
 
-        :type connection: :class:`socket._socketobject`
-        :param connection: Socket to read.
-
-        :rtype: dict
-        :return: Response from zabbix server or False in case of error.
+        Args:
+          connection: Socket to read.
+          return: Response from zabbix server or False in case of error.
         """
 
         response_header = self._receive(connection, 13)
-        LOG.debug('Response header: %s', response_header)
 
         if (not response_header.startswith(b'ZBXD\x01')
                 or len(response_header) != 13):
@@ -532,19 +484,15 @@ class ZabbixSender(object):
             response_len = struct.unpack('<Q', response_header[5:])[0]
             response_body = connection.recv(response_len)
             result = json.loads(response_body.decode("utf-8"))
-            LOG.debug('Data received: %s', result)
 
         return result
 
     def send(self, metrics):
         """Send the metrics to zabbix server.
 
-        :type metrics: list
-        :param metrics: List of :class:`zabbix.sender.ZabbixMetric` to send
-            to Zabbix
-
-        :rtype: bool
-        :return: `True` if messages was sent successful, else `False`.
+        Args:type metrics: list
+          metrics: List of ZabbixMetric to send to Zabbix
+          return: `True` if messages was sent successful, else `False`.
         """
 
         messages = self.create_messages(metrics)
@@ -1181,4 +1129,5 @@ def populate_collectors(coldir):
 
 if __name__ == '__main__':
     main(sys.argv)
+
 
