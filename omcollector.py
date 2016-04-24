@@ -253,7 +253,7 @@ class SenderThread(threading.Thread):
     """The SenderThread is responsible for connecting to the OpsMonitor
        and sending the data to it."""
 
-    def __init__(self, reader, dryrun,server_ip, server_port=DEFAULT_PORT, wait_data=True):
+    def __init__(self, reader, dryrun,server_ip, server_port=DEFAULT_PORT, stdin_mode=False):
         """Constructor.
 
         Args:
@@ -268,7 +268,7 @@ class SenderThread(threading.Thread):
         self.server_ip = server_ip  # The current OpsMonitor host we've selected.
         self.server_port = server_port  # The port of the current OpsMonitor.
         self.sendq = []
-        self.wait_data = wait_data
+        self.stdin_mode = stdin_mode
 
     def run(self):
         """Main loop. A simple scheduler. Loop waiting for 5 seconds for data on
@@ -285,7 +285,7 @@ class SenderThread(threading.Thread):
                     continue
                 self.sendq.append(line)
                 LOG.debug('Waiting 5 seconds for more data')
-                if self.wait_data:
+                if not self.stdin_mode:
                     time.sleep(5)  # Wait for more data
                 while True:
                     # prevents self.sendq fast growing in case of sending fails
@@ -300,7 +300,7 @@ class SenderThread(threading.Thread):
                         break
                     self.sendq.append(line)
 
-                if ALIVE or not self.wait_data:
+                if ALIVE or self.stdin_mode:
                     self.send_data()
                 errors = 0  # We managed to do a successful iteration.
             except (ArithmeticError, EOFError, EnvironmentError, LookupError,
@@ -689,13 +689,9 @@ def main(argv):
     reader = ReaderThread()
     reader.start()
 	
-    wait_data = True
-    if options.stdin:
-        wait_data = False
-
     # and setup the sender to start writing out to the conn
     sender = SenderThread(reader, options.dryrun,
-                          options.server_ip, options.port, wait_data)
+                          options.server_ip, options.port, options.stdin)
     sender.start()
     LOG.info('SenderThread startup complete')
 
@@ -703,7 +699,7 @@ def main(argv):
     # reader thread since there's nothing else for us to do here
     if options.stdin:
         register_collector(StdinCollector())
-        stdin_loop(options, modules, sender)
+#        stdin_loop(options, modules, sender)
     else:
         sys.stdin.close()
         main_loop(options, modules, sender)
