@@ -1,18 +1,16 @@
 #!/usr/bin/env python
-# This file is part of omcollector.
 #
 # omcollector.py
 #
-"""Simple manager for collection scripts that run and gather data.
-   The omcollector gathers the data and sends it to the OpsMonitor 
-   for storage."""
+"""Simple manager for collection scripts that run and gather data. The
+   omcollector gathers data and sends it to OpsMonitor for storage."""
+
 
 import atexit
 import errno
 import fcntl
 import logging
 import os
-import random
 import signal
 import socket
 import subprocess
@@ -31,17 +29,15 @@ from optparse import OptionParser
 # global variables.
 COLLECTORS = {}
 GENERATION = 0
-DELIMITER = None
-DEFAULT_LOG = '/var/log/omcollector.log'
+DEFAULT_LOG = '/tmp/omcollector.log'
 LOG = logging.getLogger('omcollector')
 ALIVE = True
 # If the SenderThread catches more than this many consecutive uncaught
-# exceptions, something is not right and omcollector will shutdown.
+# exceptions, omcollector will shutdown.
 MAX_UNCAUGHT_EXCEPTIONS = 100
 DEFAULT_PORT = 10051
-# How long to wait for data before assuming
-# a collector is dead and restarting it
-ALLOWED_INACTIVITY_TIME = 600  # seconds
+# Seconds to wait for data before assuming a collector is dead and restart it
+ALLOWED_INACTIVITY_TIME = 600
 MAX_SENDQ_SIZE = 10000
 MAX_READQ_SIZE = 100000
 
@@ -50,8 +46,9 @@ def register_collector(collector):
     """Register a collector with the COLLECTORS global"""
 
     assert isinstance(collector, Collector), 'collector=%r' % (collector,)
-    # store it in the global list and initiate a kill for anybody with the
-    # same name that happens to still be hanging around
+    # store it in the global dict and initiate a kill for anybody with the
+    # same name that happens to still be running.
+    # if not None, col.proc is the instance of subprocess.Popen
     if collector.name in COLLECTORS:
         col = COLLECTORS[collector.name]
         if col.proc is not None:
@@ -67,11 +64,11 @@ class ReaderQueue(Queue):
     """A Queue for the reader thread"""
 
     def nput(self, value):
-        """A nonblocking put, that simply logs and discards the value when the
-           queue is full, and returns false if we dropped."""
+        """A nonblocking put, that simply logs and discards the value when
+           the queue is full, and returns false if we dropped."""
         try:
             self.put(value, block=False)
-            LOG.debug('Put value into ReaderQueue: %s', value)
+            LOG.debug('Put into ReaderQueue: %s', value)
         except Full:
             LOG.error('QUEUE FULL ERROR, DROPPED DATA: %s', value)
             return False
@@ -79,14 +76,21 @@ class ReaderQueue(Queue):
 
 
 class Collector(object):
-    """A Collector is a script that is run that gathers some data and prints it
-       out in standard zabbix sender format on STDOUT.  This class maintains
-	   all of the state information for a given collector and gives us utility
-	   methods for working with it."""
+    """A Collector is a script that gathers some data and prints it out in
+       specified format on STDOUT.  This class maintains all of the state
+       information for a given collector and provides some useful methods
+       for working with it.
+	   
+       STDOUT FORMAT:
+        :if no space in each field: 
+         <hostname> <key> <value> <timestamp>
+        :or with space in some field:
+         <hostname>|<key>|<value>|<timestamp>
+    """
 
     def __init__(self, colname, interval, filename, mtime=0, lastspawn=0):
         """Construct a new Collector."""
-		
+
         self.name = colname
         self.interval = interval
         self.filename = filename
@@ -99,28 +103,23 @@ class Collector(object):
         self.generation = GENERATION
         self.buffer = ''
         self.datalines = []
-        self.lines_sent = 0
-        self.lines_received = 0
-        self.lines_invalid = 0
         self.last_datapoint = int(time.time())
+        LOG.debug('Construct a Collector object')
 
     def read(self):
-        """Read bytes from subprocess and store them in temporary
-           line storage buffer."""
+        """Read bytes from subprocess and store them in self.datalines"""
 
         # read stderr for log messages
         try:
             out = self.proc.stderr.read()
             if out:
-                LOG.debug('reading %s got %d bytes on stderr',
-                          self.name, len(out))
                 for line in out.splitlines():
-                    LOG.warning('%s: %s', self.name, line)
-        except IOError, (err, msg):
-            if err != errno.EAGAIN:
+                    LOG.warning('stderr %s: %s', self.name, line)
+        except IOError as err:
+            if err.errno != errno.EAGAIN:
                 raise
         except:
-            LOG.exception('uncaught exception in stderr read')
+            LOG.exception('uncaught exception in stderr read: %s', self.name)
 
         # use a buffer
         try:
@@ -128,13 +127,14 @@ class Collector(object):
             if len(self.buffer):
                 LOG.debug('reading [%s], buffer now %d bytes',
                           self.name, len(self.buffer))
-        except IOError, (err, msg):
-            if err != errno.EAGAIN:
+        except IOError as err:
+            if err.errno != errno.EAGAIN:
                 raise
         except AttributeError:
             # sometimes the process goes away in another thread and we don't
             # have it anymore, so log an error and bail
-            LOG.exception('caught exception, collector process went away while reading stdout')
+            LOG.exception('caught exception, collector process went ' +
+                          'away while reading stdout')
         except:
             LOG.exception('uncaught exception in stdout read')
             return
@@ -145,17 +145,17 @@ class Collector(object):
             if idx == -1:
                 break
 
-            # one full line is now found and we can pull it out of the buffer
+            # one full line is now found and pull it out of the buffer
             line = self.buffer[0:idx].strip()
             if line:
                 self.datalines.append(line)
                 self.last_datapoint = int(time.time())
+				
             self.buffer = self.buffer[idx+1:]
 
     def collect(self):
-        """Reads input from the collector and returns the lines up to whomever
-           is calling us.  This is a generator that returns a line as it
-           becomes available."""
+        """Reads input from the collector and returns the lines. This is
+           a generator that returns a line as it becomes available."""
 
         while self.proc is not None:
             self.read()
@@ -167,6 +167,7 @@ class Collector(object):
     def shutdown(self):
         """Cleanly shut down the collector"""
 
+        LOG.debug('Shutting down: %s', self.name)
         if not self.proc:
             return
         try:
@@ -218,14 +219,13 @@ class ReaderThread(threading.Thread):
 
         super(ReaderThread, self).__init__()
         self.readerq = ReaderQueue(MAX_READQ_SIZE)
-        self.lines_collected = 0
-        self.lines_dropped = 0
+        self.name = 'Reader'
 
     def run(self):
         """Main loop for this thread. Reads from collectors,
            does data processing and puts the data into the queue."""
 
-        LOG.debug("ReaderThread up and running")
+        LOG.info("ReaderThread is up and running")
 
         while ALIVE:
             for col in all_living_collectors():
@@ -234,33 +234,26 @@ class ReaderThread(threading.Thread):
 
             time.sleep(1)
 
-    def process_line(self, col, line, delimiter=DELIMITER):
+    def process_line(self, col, line):
         """Parses the given line and appends the result to the reader queue."""
 
-        self.lines_collected += 1
-        col.lines_received += 1
-        data_list = line.split(delimiter)
+        data_list = line.split()
 		
         #Only 'host', 'key', 'value', <'timestampe'> are needed.
         if len(data_list) > 4 or len(data_list) < 3:
             LOG.warning('%s lenth of line %s is %d, invalid', 
                         col.name, line, len(data_list))
-            col.lines_invalid += 1
             return
-			
-        if not self.readerq.nput(data_list):
-            self.lines_dropped += 1
-			
-        LOG.debug('[%s] line received: %d, line invalid: %d', 
-		          col.name, col.lines_received, col.lines_invalid)
+        else:
+            self.readerq.nput(data_list)
+            LOG.debug('Put into Queue: %s', str(data_list))
 
 
 class SenderThread(threading.Thread):
     """The SenderThread is responsible for connecting to the OpsMonitor
        and sending the data to it."""
 
-    def __init__(self, reader, dryrun,server_ip,
-                 server_port=DEFAULT_PORT, wait_data=True):
+    def __init__(self, reader, dryrun,server_ip, server_port=DEFAULT_PORT, wait_data=True):
         """Constructor.
 
         Args:
@@ -269,6 +262,7 @@ class SenderThread(threading.Thread):
                   being sent to the OpsMonitor.
         """
         super(SenderThread, self).__init__()
+        self.name = 'Sender'
         self.dryrun = dryrun
         self.reader = reader
         self.server_ip = server_ip  # The current OpsMonitor host we've selected.
@@ -290,8 +284,8 @@ class SenderThread(threading.Thread):
                 except Empty:
                     continue
                 self.sendq.append(line)
+                LOG.debug('Waiting 5 seconds for more data')
                 if self.wait_data:
-                    LOG.debug('Waiting 5 seconds for more data')
                     time.sleep(5)  # Wait for more data
                 while True:
                     # prevents self.sendq fast growing in case of sending fails
@@ -336,7 +330,6 @@ class SenderThread(threading.Thread):
             LOG.debug('send_data no data')
             return
 
-
         # try sending our data.  if an exception occurs, just error and
         # try sending again next time.
         
@@ -370,12 +363,11 @@ class ZabbixMetric(object):
             self.clock = clock
         else:
             self.clock = int(time.time())
-
+			
     def __repr__(self):
         """Represent detailed ZabbixMetric view."""
 
         result = json.dumps(self.__dict__)
-        LOG.debug('%s: %s', self.__class__.__name__, result)
 
         return result
 
@@ -396,7 +388,6 @@ class ZabbixSender(object):
     """
 
     def __init__(self, server_ip='127.0.0.1', server_port=10051):
-
         self.server_ip = server_ip
         self.server_port = server_port
 
@@ -404,10 +395,9 @@ class ZabbixSender(object):
         """Represent detailed ZabbixSender view."""
 
         result = json.dumps(self.__dict__)
-        LOG.debug('%s: %s', self.__class__.__name__, result)
 
-        return result
-
+        return result	
+	
     def _receive(self, sock, count):
         """Reads socket to receive data from zabbix server.
 
@@ -481,12 +471,13 @@ class ZabbixSender(object):
 
         if (not response_header.startswith(b'ZBXD\x01')
                 or len(response_header) != 13):
-            LOG.debug('Zabbix return not valid response.')
+            LOG.error('Zabbix return not valid response.')
             result = False
         else:
             response_len = struct.unpack('<Q', response_header[5:])[0]
             response_body = connection.recv(response_len)
             result = json.loads(response_body.decode("utf-8"))
+            LOG.info('Data received: %s', result)
 
         return result
 
@@ -502,39 +493,25 @@ class ZabbixSender(object):
         request = self.create_request(messages)
         packet = self.create_packet(request)
 
-        LOG.debug('Sending data to %s:%s'  
-                  % (self.server_ip, self.server_port))
-
         try:
             connection = socket.socket()
             connection.settimeout(5)
             connection.connect((self.server_ip, self.server_port))
-            LOG.debug('Connection to %s:%s was successful' 
-                      %(self.server_ip, self.server_port))
-        except socket.error, msg:		
-            LOG.warning('Connection attempt failed to %s:%d: %s'
-                    %(self.server_ip, self.server_port, msg))
-            connection.close()
-
-        try:
             connection.sendall(packet)
-        except socket.error, msg:
-            LOG.error('failed to send data: %s', msg)
+        except Exception as err:
             try:
                 connection.close()
-            except socket.error:
+            except Exception as err:
                 pass
-            return False
+            raise Exception(err)
 
         response = self.get_response(connection)
-        LOG.debug('%s response: %s', self.server_ip, response)
 
         if response and response.get('response') == 'success':
             return True
         else:
-            LOG.debug('Response error: %s}', response)
             return False
-			
+		
 
 def setup_logging(logfile=DEFAULT_LOG, max_bytes=None, backup_count=None):
     """Sets up logging and associated handlers."""
@@ -547,8 +524,8 @@ def setup_logging(logfile=DEFAULT_LOG, max_bytes=None, backup_count=None):
     else:  # Setup stream handler.
         ch = logging.StreamHandler(sys.stdout)
 
-    ch.setFormatter(logging.Formatter('%(asctime)s %(name)s[%(process)d] '
-                                      '%(levelname)s: %(message)s'))
+    ch.setFormatter(logging.Formatter('%(asctime)s %(name)s[%(process)d]'
+              '[%(threadName)s]%(funcName)s %(levelname)s: %(message)s'))
     LOG.addHandler(ch)
 	
 
@@ -556,7 +533,7 @@ def parse_cmdline(argv):
     """Parses the command-line."""
 
     try:
-        import config
+        from collectors.etc import config
         defaults = config.get_defaults()
     except ImportError:
         sys.stderr.write("ImportError: Could not load defaults from configuration. Using hardcoded values\n")
@@ -593,12 +570,12 @@ def parse_cmdline(argv):
     parser.add_option('-D', '--daemonize', dest='daemonize', action='store_true',
                         default=defaults['daemonize'],
                         help='Run as a background daemon.')
-    parser.add_option('-H', '--server_ip', dest='server_ip',
+    parser.add_option('-z', '--server_ip', dest='server_ip',
                         default=defaults['server_ip'],
                         help='Hostname to use to connect to the OpsMonitor.')
-    parser.add_option('-s', '--stdin', dest='stdin', action='store_true',
+    parser.add_option('-S', '--stdin', dest='stdin', action='store_true',
                         default=defaults['stdin'],
-                        help='Run once, read and dedup data points from stdin.')
+                        help='Run once, read data points from stdin.')
     parser.add_option('-p', '--port', dest='port', type='int',
                         default=defaults['port'], metavar='PORT',
                         help='Port to connect to the OpsMonitor instance on. '
@@ -655,8 +632,8 @@ def daemonize():
     for fd in xrange(3, 1024):
         try:
             os.close(fd)
-        except OSError:  # This FD wasn't opened...
-            pass         # ... ignore the exception.
+        except OSError:
+            pass
 
 
 def setup_python_path(collector_dir):
@@ -688,7 +665,7 @@ def main(argv):
                   options.backup_count or None)
 
     if options.verbose:
-        LOG.setLevel(logging.DEBUG)  # up our level
+        LOG.setLevel(logging.DEBUG)
 
     if options.pidfile:
         write_pid(options.pidfile)
@@ -711,7 +688,7 @@ def main(argv):
     # so we can have it running and pulling in data for us
     reader = ReaderThread()
     reader.start()
-
+	
     wait_data = True
     if options.stdin:
         wait_data = False
@@ -745,8 +722,8 @@ def stdin_loop(options, modules, sender):
     global ALIVE
     next_heartbeat = int(time.time() + 600)
     while ALIVE:
-        time.sleep(1)
-#        reload_changed_config_modules(modules, options, sender)
+        time.sleep(5)
+        reload_changed_config_modules(modules, options, sender)
         now = int(time.time())
         if now >= next_heartbeat:
             LOG.info('Heartbeat (%d collectors running)'
@@ -814,13 +791,7 @@ def load_config_module(name, options):
         module = __import__(name[:-3], d, d)
     else:
         module = reload(name)
-    onload = module.__dict__.get('onload')
-    if callable(onload):
-	try:
-            onload(options)
-        except:
-            LOG.fatal('Exception while loading %s', name)
-            raise
+ 
     return module
 
 
