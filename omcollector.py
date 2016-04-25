@@ -38,8 +38,8 @@ MAX_UNCAUGHT_EXCEPTIONS = 100
 DEFAULT_PORT = 10051
 # Seconds to wait for data before assuming a collector is dead and restart it
 ALLOWED_INACTIVITY_TIME = 600
-MAX_SENDQ_SIZE = 10000
-MAX_READQ_SIZE = 100000
+MAX_SENDQ_SIZE = 200
+MAX_READQ_SIZE = 2000
 
 
 def register_collector(collector):
@@ -104,7 +104,6 @@ class Collector(object):
         self.buffer = ''
         self.datalines = []
         self.last_datapoint = int(time.time())
-        LOG.debug('Construct a Collector object')
 
     def read(self):
         """Read bytes from subprocess and store them in self.datalines"""
@@ -214,12 +213,14 @@ class ReaderThread(threading.Thread):
        All data read is put into the self.readerq Queue, which is consumed 
 	   by the SenderThread."""
 
-    def __init__(self):
+    def __init__(self, stdin_mode=False, delimiter=None):
         """Constructor."""
 
         super(ReaderThread, self).__init__()
         self.readerq = ReaderQueue(MAX_READQ_SIZE)
         self.name = 'Reader'
+        self.delimiter = delimiter
+        self.stdin_mode = stdin_mode
 
     def run(self):
         """Main loop for this thread. Reads from collectors,
@@ -232,12 +233,15 @@ class ReaderThread(threading.Thread):
                 for line in col.collect():
                     self.process_line(col, line)
 
-            time.sleep(1)
+            if self.stdin_mode:
+                time.sleep(0.1)
+            else:
+                time.sleep(1)
 
     def process_line(self, col, line):
         """Parses the given line and appends the result to the reader queue."""
 
-        data_list = line.split()
+        data_list = line.split(self.delimiter)
 		
         #Only 'host', 'key', 'value', <'timestampe'> are needed.
         if len(data_list) > 4 or len(data_list) < 3:
@@ -246,7 +250,6 @@ class ReaderThread(threading.Thread):
             return
         else:
             self.readerq.nput(data_list)
-            LOG.debug('Put into Queue: %s', str(data_list))
 
 
 class SenderThread(threading.Thread):
@@ -284,7 +287,6 @@ class SenderThread(threading.Thread):
                 except Empty:
                     continue
                 self.sendq.append(line)
-                LOG.debug('Waiting 5 seconds for more data')
                 if not self.stdin_mode:
                     time.sleep(5)  # Wait for more data
                 while True:
@@ -337,6 +339,7 @@ class SenderThread(threading.Thread):
             sys.stdout.write(str(metrics) + '\n')
             return
         else:
+            LOG.debug('%d metrics to be sent', len(metrics))
             sender = ZabbixSender(self.server_ip, self.server_port)
             if sender.send(metrics):
                 self.sendq = []
@@ -350,9 +353,6 @@ class ZabbixMetric(object):
       key: Key by which you will identify this metric.
       value: Metric value.
       clock: Unix timestamp. Current time will used if not specified.
-
-    >>> from pyzabbix import ZabbixMetric
-    >>> ZabbixMetric('localhost', 'cpu[usage]', 20)
     """
 
     def __init__(self, host, key, value, clock=None):
@@ -524,8 +524,8 @@ def setup_logging(logfile=DEFAULT_LOG, max_bytes=None, backup_count=None):
     else:  # Setup stream handler.
         ch = logging.StreamHandler(sys.stdout)
 
-    ch.setFormatter(logging.Formatter('%(asctime)s %(name)s[%(process)d]'
-              '[%(threadName)s]%(funcName)s %(levelname)s: %(message)s'))
+    ch.setFormatter(logging.Formatter('%(asctime)s %(name)s:[%(process)d]:'
+              '%(threadName)s:%(funcName)s:%(levelname)s: %(message)s'))
     LOG.addHandler(ch)
 	
 
@@ -536,8 +536,10 @@ def parse_cmdline(argv):
         from collectors.etc import config
         defaults = config.get_defaults()
     except ImportError:
-        sys.stderr.write("ImportError: Could not load defaults from configuration. Using hardcoded values\n")
-        default_cdir = os.path.join(os.path.dirname(os.path.realpath(sys.argv[0])), 'collectors')
+        sys.stderr.write("Could not load configuration. Using hardcoded values\n")
+        default_cdir = os.path.join(os.path.dirname(os.path.realpath(sys.argv[0])),
+                                                    'collectors')
+
         defaults = {
             'verbose': False,
             'allowed_inactivity_time': 600,
@@ -545,6 +547,7 @@ def parse_cmdline(argv):
             'max_bytes': 64 * 1024 * 1024,
             'server_ip': '192.168.1.102',
             'port': 10051,
+            'delimiter': None,
             'pidfile': '/var/run/omcollector.pid',
             'remove_inactive_collectors': False,
             'backup_count': 1,
@@ -579,6 +582,10 @@ def parse_cmdline(argv):
     parser.add_option('-p', '--port', dest='port', type='int',
                         default=defaults['port'], metavar='PORT',
                         help='Port to connect to the OpsMonitor instance on. '
+                        'default=%default')
+    parser.add_option('-F', '--delimiter', dest='delimiter',
+                        default=defaults['delimiter'],
+                        help='A special character to use to split line. '
                         'default=%default')
     parser.add_option('-v', dest='verbose', action='store_true',
                         default=defaults['verbose'],
@@ -661,6 +668,7 @@ def main(argv):
 
     if options.daemonize:
         daemonize()
+
     setup_logging(options.logfile, options.max_bytes or None,
                   options.backup_count or None)
 
@@ -686,7 +694,7 @@ def main(argv):
 
     # at this point we're ready to start processing, so start the ReaderThread
     # so we can have it running and pulling in data for us
-    reader = ReaderThread()
+    reader = ReaderThread(options.stdin, options.delimiter)
     reader.start()
 	
     # and setup the sender to start writing out to the conn
@@ -699,7 +707,6 @@ def main(argv):
     # reader thread since there's nothing else for us to do here
     if options.stdin:
         register_collector(StdinCollector())
-#        stdin_loop(options, modules, sender)
     else:
         sys.stdin.close()
         main_loop(options, modules, sender)
@@ -712,19 +719,6 @@ def main(argv):
     LOG.debug('Shutting down -- joining the sender thread.')
     sender.join()
 
-def stdin_loop(options, modules, sender):
-    """The main loop of the program that runs when we are in stdin mode."""
-
-    global ALIVE
-    next_heartbeat = int(time.time() + 600)
-    while ALIVE:
-        time.sleep(5)
-        reload_changed_config_modules(modules, options, sender)
-        now = int(time.time())
-        if now >= next_heartbeat:
-            LOG.info('Heartbeat (%d collectors running)'
-                     % sum(1 for col in all_living_collectors()))
-            next_heartbeat = now + 600
 
 def main_loop(options, modules, sender):
     """The main loop of the program that runs when we're not in stdin mode."""
@@ -908,17 +902,11 @@ def reap_children():
 
     for col in all_living_collectors():
         now = int(time.time())
-        # FIXME: this is not robust.  the asyncproc module joins on the
-        # reader threads when you wait if that process has died.  this can cause
-        # slow dying processes to hold up the main loop.  good for now though.
         status = col.proc.poll()
         if status is None:
             continue
         col.proc = None
 
-        # behavior based on status.  a code 0 is normal termination, code 13
-        # is used to indicate that we don't want to restart this collector.
-        # any other status code is an error and is logged.
         if status == 13:
             LOG.info('removing %s from the list of collectors (by request)',
                       col.name)
@@ -971,9 +959,7 @@ def spawn_collector(col):
     except OSError, e:
         LOG.error('Failed to spawn collector %s: %s' % (col.filename, e))
         return
-    # The following line needs to move below this line because it is used in
-    # other logic and it makes no sense to update the last spawn time if the
-    # collector didn't actually start.
+    
     col.lastspawn = int(time.time())
     # Without setting last_datapoint here, a long running check (>15s) will be 
     # killed by check_children() the first time check_children is called.
@@ -984,7 +970,6 @@ def spawn_collector(col):
         col.dead = False
         LOG.info('spawned %s (pid=%d)', col.name, col.proc.pid)
         return
-    # FIXME: handle errors better
     LOG.error('failed to spawn collector: %s', col.filename)
 
 
@@ -1006,10 +991,6 @@ def spawn_children():
                 spawn_collector(col)
                 continue
 
-            # I'm not very satisfied with this path.  It seems fragile and
-            # overly complex, maybe we should just reply on the asyncproc
-            # terminate method, but that would make the main omcollector
-            # block until it dies... :|
             if col.nextkill > now:
                 continue
             if col.killstate == 0:
@@ -1065,9 +1046,6 @@ def populate_collectors(coldir):
                 if colname in COLLECTORS:
                     col = COLLECTORS[colname]
 
-                    # if we get a dupe, then ignore the one we're trying to
-                    # add now.  there is probably a more robust way of doing
-                    # this...
                     if col.interval != interval:
                         LOG.error('two collectors with the same name %s and '
                                    'different intervals %d and %d',

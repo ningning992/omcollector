@@ -19,6 +19,7 @@ def get_defaults():
         'max_bytes': 64 * 1024 * 1024,
         'server_ip': '192.168.1.102',
         'port': 10051,
+        'delimiter': None,
         'pidfile': '/var/run/omcollector.pid',
         'remove_inactive_collectors': False,
         'backup_count': 1,
